@@ -148,6 +148,11 @@ class BatchedEvalPolicy:
             mm_token_type_ids=mmtt,
         )
 
+        # Layer-depth ablation (local addition, off unless a blinder is attached by --blind_layer).
+        blinder = getattr(self, "visual_blinder", None)
+        if blinder is not None:
+            blinder.set_visual((iid == video_token_id) | (iid == image_token_id))
+
         out = lm(
             inputs_embeds=emb,
             attention_mask=att,
@@ -210,6 +215,9 @@ class BatchedEvalPolicy:
                     runaway[i] = True
             if all(row_done(i, step + 1) for i in range(N)):
                 break
+
+        if blinder is not None:
+            blinder.clear()
 
         if any(runaway):
             print(

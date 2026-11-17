@@ -116,6 +116,28 @@ def _token_id(processor: AutoProcessor, token: str) -> int:
     raise ValueError(f"Tokenizer does not define required token {token!r}")
 
 
+def native_history_positions(cur: int, n: int, stride: int, variable_history: bool) -> list[int]:
+    """The model's own history rule (same arithmetic as RoboMMEPolicy._history_positions)."""
+    if variable_history:
+        avail = cur // stride + 1
+        m = variable_history_frames(avail)
+        return [max(0, cur - (m - 1 - i) * stride) for i in range(m)]
+    offsets = [-(n - 1 - i) * stride for i in range(n)] if n > 1 else [0]
+    return [max(0, cur + off) for off in offsets]
+
+
+def windowed_history_positions(
+    cur: int, n: int, stride: int, variable_history: bool, context_frames: int
+) -> list[int]:
+    """Context window of K frames: the native rule on a history that starts K frames ago.
+
+    The buffer is treated as if its first frame were ``lo = cur - (K - 1) * stride``, so the
+    model input is what the unmodified policy produces for an episode that began there.
+    """
+    lo = max(0, cur - (int(context_frames) - 1) * stride)
+    return [lo + p for p in native_history_positions(cur - lo, n, stride, variable_history)]
+
+
 class RoboMMEPolicy:
 
     def __init__(
@@ -127,12 +149,18 @@ class RoboMMEPolicy:
         num_denoising_steps: int = 10,
         temperature: float = 1.0,
         max_subtask_tokens: int = 64,
+        context_frames: int | None = None,
     ):
         if vla.config.control_frequency_hz is None:
             raise ValueError(
                 "Checkpoint config is missing control_frequency_hz; cannot rebuild "
                 "the embodiment prompt."
             )
+        # Context-window ablation (local addition; None = the unmodified model): the history
+        # rule below is applied to a buffer that starts (context_frames - 1) sampled frames ago.
+        if context_frames is not None and int(context_frames) < 1:
+            raise ValueError("context_frames must be >= 1")
+        self.context_frames = None if context_frames is None else int(context_frames)
         self.vla = vla
         self.processor = processor
         self.unnormalize = unnormalize_action
@@ -217,6 +245,10 @@ class RoboMMEPolicy:
         cur = len(buf) - 1
         if cur < 0:
             raise RuntimeError("call observe() before predict()")
+        if self.context_frames is not None:
+            return windowed_history_positions(
+                cur, self.n_frames, self.stride, self.variable_history, self.context_frames
+            )
         n, stride = self.n_frames, self.stride
         if self.variable_history:
             avail = cur // stride + 1

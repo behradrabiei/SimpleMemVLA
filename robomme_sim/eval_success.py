@@ -100,6 +100,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--seed", type=int, default=0,
                     help="Seed for torch/numpy at the start of the run (local addition; upstream "
                          "hard-codes 0, which stays the default).")
+    ap.add_argument("--context_frames", type=int, default=None,
+                    help="Context-window ablation (local addition): show the model only the newest "
+                         "K sampled history frames, via its own history rule applied to a history "
+                         "that starts K frames ago. Unset = the unmodified model.")
+    ap.add_argument("--blind_layer", type=int, default=None,
+                    help="Layer-depth ablation (local addition): from this decoder layer (zero-based) "
+                         "on, no token can read the visual tokens (robomme_sim/layer_blind.py). "
+                         "Unset = the unmodified model.")
     ap.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True,
                     help="Local addition: skip episodes already recorded in episodes.jsonl next to "
                          "results.json (same settings required). --no-resume starts the record afresh.")
@@ -134,6 +142,10 @@ def build_policy(args):
     )
     device = next(vla.parameters()).device
     if getattr(args, "pipelined", False):
+        if getattr(args, "context_frames", None) is not None:
+            raise SystemExit("[eval] --context_frames is not supported with --pipelined.")
+        if getattr(args, "blind_layer", None) is not None:
+            raise SystemExit("[eval] --blind_layer is not supported with --pipelined.")
         from robomme_sim.pipelined_policy import PipelinedBufferPolicy, PipelinedEvalGroup
 
         def buffer_factory():
@@ -169,6 +181,12 @@ def build_policy(args):
         num_denoising_steps=args.num_denoising_steps, eval_temperature=args.eval_temperature,
         max_subtask_tokens=args.max_subtask_tokens, device=device,
     )
+    if getattr(args, "blind_layer", None) is not None:
+        from robomme_sim.layer_blind import VisualBlinder
+
+        batched.visual_blinder = VisualBlinder(vla.backbone.model.language_model, args.blind_layer)
+        print(f"[eval] blind_layer={args.blind_layer}: visual tokens hidden from decoder layers "
+              f"{args.blind_layer}..{batched.visual_blinder.num_layers - 1}", flush=True)
 
     def buffer_factory():
         return RoboMMEPolicy(
@@ -176,6 +194,7 @@ def build_policy(args):
             unnormalize_action=unnormalize_action, normalize_state=normalize_state,
             num_denoising_steps=args.num_denoising_steps, temperature=args.eval_temperature,
             max_subtask_tokens=args.max_subtask_tokens,
+            context_frames=getattr(args, "context_frames", None),
         )
 
     return batched, buffer_factory, normalize_state
@@ -193,7 +212,7 @@ def _episodes_log_path(args) -> str | None:
 # Settings that change an episode's outcome; a resumed run must match them exactly.
 _RESUME_KEYS = ("pretrained_checkpoint", "dataset_split", "execute_horizon", "max_steps",
                 "num_denoising_steps", "eval_temperature", "max_subtask_tokens", "pipelined",
-                "compute_dtype", "attn_implementation", "seed")
+                "compute_dtype", "attn_implementation", "seed", "context_frames", "blind_layer")
 
 
 def _run_config(args) -> dict:
@@ -332,6 +351,8 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
     success = [False] * G
     steps = [0] * G
     n_calls = [0] * G
+    hist_age = [0] * G       # audit: oldest history frame shown, in steps before the current one
+    hist_distinct = [0] * G  # audit: most distinct history frames shown at one decision
     status = ["ongoing"] * G
     group_t0 = time.time()
 
@@ -341,6 +362,9 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
             "success": bool(success[g]), "status": status[g],
             "steps": int(steps[g]), "n_calls": int(n_calls[g]),
             "seed": int(getattr(args, "seed", 0)),
+            "context_frames": getattr(args, "context_frames", None),
+            "blind_layer": getattr(args, "blind_layer", None),
+            "max_history_age_steps": int(hist_age[g]), "max_history_frames": int(hist_distinct[g]),
             "group_size": G, "wall_s": round(time.time() - group_t0, 1),
         })
 
@@ -359,6 +383,11 @@ def run_group(args, pool, batched, buffer_factory, normalize_state, task, specs,
         if not act:
             break
         processed_list = [buffers[g]._prepare_inputs(instructions[g]) for g in act]
+        for k, g in enumerate(act):
+            shown = {i for _tag, ga, gb in processed_list[k]["video_patch_keys"] for i in (ga, gb)}
+            cur_idx = buffers[g]._frames_seen[buffers[g].history_image_keys[0]] - 1
+            hist_age[g] = max(hist_age[g], cur_idx - min(shown))
+            hist_distinct[g] = max(hist_distinct[g], len(shown))
         state_list = [state_norm(cur_state[g]) for g in act]
         decisions = batched.generate_batch(processed_list, state_list)
 
